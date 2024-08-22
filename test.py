@@ -72,3 +72,29 @@ def test_fused_ffn():
 
     # TODO: how can we do better precision?
     assert torch.allclose(z, z_torch, atol=9e-2), (z - z_torch).abs().max()
+
+
+def _get_attn_inputs(B, N, L, H, device):
+    torch.manual_seed(1337)
+    q = torch.rand((B, N, L, H), device=device)
+    k = torch.rand_like(q)
+    v = torch.rand_like(q)
+    return q, k, v
+
+
+def test_flash_attention_v1():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    B = 128
+    N = 8
+    L = 32
+    H = 16
+    q, k, v = _get_attn_inputs(B, N, L, H)
+
+    z_torch = ...
+
+    z = flash_attention_v1(
+        q,
+        k,
+        v,
+    )
+    assert torch.allclose(z, z_torch, atol=1e-5), (z - z_torch).abs().max()

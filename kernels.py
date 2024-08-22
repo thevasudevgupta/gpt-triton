@@ -88,6 +88,7 @@ def fused_embeddings(x, wte, wpe, dropout_prob=0.0):
 def fused_layer_norm_kernel(
     x_ptr, w_ptr, b_ptr, z_ptr, N, eps=1e-5, BLOCK_SIZE: tl.constexpr = 16
 ):
+    # f = ((x - mean) / (std + eps)) * w + b
     # x: (M, N)
     # launch with 1D grid along M direction
 
@@ -280,49 +281,51 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
 
 
 # @triton.jit
-# def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
-#     # x: (N0, T)
-#     # out: (N0, T)
+# def softmax_kernel(x_ptr, z_ptr, L, N1, H, BLOCK_SIZE_L: tl.constexpr, B1: tl.constexpr):
+#     # x: (L, H)
+#     # out: (L, H)
 #     pid_0 = tl.program_id(0)
-#     x_ptr += pid_0 * T
-#     z_ptr += pid_0 * T
-
+#     x_ptr += pid_0 * H
+#     z_ptr += pid_0 * H
 #     max_value, denominator = 0.0, 0.0
-#     for i in range(0, T, B1):
+#     for i in range(0, H, B1):
 #         offset = tl.arange(i, i + B1)
-#         x = tl.load(x_ptr + offset, mask=offset < T, other=0)
-
+#         x = tl.load(x_ptr + offset, mask=offset < H, other=0)
 #         block_max_value = tl.max(x, keep_dims=True)
 #         new_max_value = tl.where(
 #             block_max_value > max_value, block_max_value, max_value
 #         )
-
 #         x = tl.exp(x - new_max_value)
 #         denominator = denominator / tl.exp(new_max_value - max_value)
-
 #         denominator += tl.sum(x)
 #         max_value = new_max_value
-
-#     for i in range(0, T, B1):
+#     for i in range(0, H, B1):
 #         offset = tl.arange(i, i + B1)
-#         x = tl.load(x_ptr + offset, mask=offset < T, other=0)
+#         x = tl.load(x_ptr + offset, mask=offset < H, other=0)
 #         z = tl.exp(x - max_value)
 #         z = z / denominator
-#         tl.store(z_ptr + offset, z, mask=offset < T)
+#         tl.store(z_ptr + offset, z, mask=offset < H)
 
 
-# # TODO: what if we just write separate kernel for this?
-# @torch.no_grad()
-# def matmul_and_split_qkv(x, weight, bias):
-#     # x: (batch_size, seqlen, hidden_size)
-#     x = fused_ffn1(x, weight, bias, add_gelu=False)
-#     q, k, v = x.split(self.n_embd, dim=2)
-#     # (batch_size, seqlen, num_heads, head_size)
-#     # TODO: following is unecessary read & write - memory bound operation
-#     q, k, v = map(lambda x: x.transpose(1, 2).contiguous(), (q, k, v))
-#     # (batch_size, num_heads, seqlen, head_size)
-#     # Splits the tensor into chunks. Each chunk is a view of the original tensor.
-#     return q, k, v
+# TODO: what if we just write separate kernel for this?
+# TODO: can we fuse this in attention kernel?
+@torch.no_grad()
+def matmul_and_split_qkv(x, weight, bias, num_heads):
+    # x: (batch_size, seqlen, hidden_size)
+    x = fused_ffn1(x, weight, bias, add_gelu=False)
+    # (batch_size, seqlen, 3 * hidden_size)
+    q, k, v = x.split(self.n_embd, dim=2)
+    batch_size, seqlen, hidden_size = q.shape
+    assert hidden_size % head_size == 0
+    head_size = head_size // num_heads
+    # (batch_size, seqlen, num_heads, head_size)
+    # TODO: following is unecessary read & write - memory bound operation
+    q, k, v = map(
+        lambda x: x.view(batch_size, seqlen, num_heads, head_size).transpose(1, 2),
+        (q, k, v),
+    )
+    # (batch_size, num_heads, seqlen, head_size)
+    return q, k, v
 
 
 # TODO: read about flash-2 and see if we can switch to that
@@ -331,52 +334,71 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
 # pytorch flex-attention does something like that - it would make computation 50% efficient
 @triton.jit
 def flash_attention_v1_kernel(
-    q_ptr, k_ptr, v_ptr, z_ptr, N0: tl.constexpr, T: tl.constexpr, B0: tl.constexpr
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    z_ptr,
+    BN,
+    L,
+    H,
+    dropout_prob=0.0,
+    seed=1337,
+    BLOCK_SIZE_BN: tl.constexpr = 128,
+    BLOCK_SIZE_L: tl.constexpr = 128,
 ):
-    # q: (N0, T)
-    # k: (N0, T)
-    # v: (N0, T)
-    # z: (N0, T)
-    pid_0 = tl.program_id(0)
+    # f = (q @ k.T) / math.sqrt(head_size)
+    # f = dropout(F.softmax(apply_causal_mask(f), dim=-1))
+    # f = f @ v
 
-    # assuming that `T` can stay sram fully and doesn't require blocking
+    # q, k, v, z: (B * N, L, H)
+    # TODO: implement causal mask?
+
+    pid_bn = tl.program_id(0)
+    offs_bn = pid_bn * BLOCK_SIZE_BN * (L * H)
+    q_ptr += offs_bn
+    k_ptr += offs_bn
+    v_ptr += offs_bn
+    z_ptr += offs_bn
+
+    # assuming that `H` can stay SRAM fully and doesn't require blocking
     # this assumptions was made for original implementation of flash attention as well
     # its reasonable as most of LLMs use head size <= 256
+    pid_l = tl.program_id(1)
+    offs_l = pid_l * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)[:, None]
+    offs_h = tl.arange(0, H)[None, :]
 
-    offs_b = pid_0 * B0 + tl.arange(0, B0)[:, None]
-    offs_t = tl.arange(0, T)[None, :]
-
-    q_mask = offs_b < N0
+    q_mask = offs_l < L
     # this remains in sram throughtout computation
-    q_offs = offs_b * T + offs_t
+    q_offs = offs_l * H + offs_h
 
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
-    # (B0, T)
+    # (BLOCK_SIZE_L, H)
 
     # loop over k, v and compute attention & weighted v
-    z = tl.zeros((B0, T), dtype=tl.float32)
-    max_value = tl.zeros((B0, 1), dtype=tl.float32) + float("-inf")
-    denominator = tl.zeros((B0, 1), dtype=tl.float32)
-    for i in range(0, N0, B0):
+    z = tl.zeros((BLOCK_SIZE_L, H), dtype=tl.float32)
+    max_value = tl.zeros((BLOCK_SIZE_L, 1), dtype=tl.float32) + float("-inf")
+    denominator = tl.zeros((BLOCK_SIZE_L, 1), dtype=tl.float32)
+    for i in range(0, L, BLOCK_SIZE_L):
 
-        mask = (i + tl.arange(0, B0)[:, None]) < N0
-        offs = (i + tl.arange(0, B0)[:, None]) * T + tl.arange(0, T)[None, :]
+        mask = (i + tl.arange(0, BLOCK_SIZE_L)[:, None]) < L
+        offs = (i + tl.arange(0, BLOCK_SIZE_L)[:, None]) * H + tl.arange(0, H)[None, :]
 
         k = tl.load(k_ptr + offs, mask=mask, other=0.0)
-        # (B0, T)
+        # (BLOCK_SIZE_L, H)
 
         qk = tl.dot(q, k.trans(1, 0))
-        # (B0, B0)
+        qk /= tl.sqrt(H)
+        # (BLOCK_SIZE_L, BLOCK_SIZE_L)
 
         block_max_value = tl.max(qk, axis=1, keep_dims=True)
-        # (B0, 1)
+        # (BLOCK_SIZE_L, 1)
         new_max_value = tl.where(
             block_max_value > max_value, block_max_value, max_value
         )
-        # (B0, 1)
+        # (BLOCK_SIZE_L, 1)
 
         qk = tl.exp(qk - new_max_value)
-        # (B0, B0)
+        # (BLOCK_SIZE_L, BLOCK_SIZE_L)
 
         multiplier = tl.exp(max_value - new_max_value)
         denominator *= multiplier
@@ -384,13 +406,17 @@ def flash_attention_v1_kernel(
 
         denominator += tl.sum(qk, axis=1, keep_dims=True)
         max_value = new_max_value
-        # (B0, 1)
+        # (BLOCK_SIZE_L, 1)
+
+        if dropout_prob > 0.0:
+            # TODO: is it fine to pass qk instead of offset?
+            qk = dropout(qk, dropout_prob, seed, qk)
 
         v = tl.load(v_ptr + offs, mask=mask, other=0.0)
-        # (B0, T)
+        # (BLOCK_SIZE_L, H)
 
         z = tl.dot(qk, v, acc=z)
-        # (B0, T)
+        # (BLOCK_SIZE_L, H)
 
     z /= denominator
     tl.store(z_ptr + q_offs, z, mask=q_mask)
@@ -398,33 +424,25 @@ def flash_attention_v1_kernel(
 
 @torch.no_grad()
 def flash_attention_v1(q, k, v):
+    assert q.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert q.shape == k.shape == v.shape
+    B, N, L, H = q.shape
 
-    # B, T, C = x.size()
-    # # batch size, sequence length, embedding dimensionality (n_embd)
+    BLOCK_SIZE_BN = 128
+    BLOCK_SIZE_L = 128
 
-    # # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-    # q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-    # k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-    # # (B, nh, T, hs)
-    # q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-    # # (B, nh, T, hs)
-    # v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-    # # (B, nh, T, hs)
+    # TODO: try to run without this constraint and see if we get errors
+    # assert head_size <= 256
+    # above condition is necessary because shared memory is limited
+    # and we don't do additional blocking over head_size dim
 
-    # # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-
-    # # manual implementation of attention
-    # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-    # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-    # att = F.softmax(att, dim=-1)
-    # att = self.attn_dropout(att)
-    # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-    # y = y.transpose(1, 2).contiguous().view(B, T, C)
-
-    grid = ()
-    launch_trition(
-        fused_attention_kernel,
-        grid,
+    grid = (triton.cdiv(B * N, BLOCK_SIZE_BN), triton.cdiv(L, BLOCK_SIZE_L), 1)
+    flash_attention_v1_kernel[grid](
+        q.view(B * N, L, H),
+        k.view(B * N, L, H),
+        v.view(B * N, L, H),
     )
 
-    return
+    return z.view(B, N, L, H)

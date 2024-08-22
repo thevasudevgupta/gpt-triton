@@ -52,9 +52,10 @@ class FusedMLP(nn.Module):
 
 
 class FusedAttention(nn.Module):
-    def __init__(self, hidden_size, dropout_prob=0.0):
+    def __init__(self, hidden_size, num_heads, dropout_prob=0.0):
         super().__init__()
         self.dropout_prob = dropout_prob
+        self.num_heads = num_heads
         self.layer_norm_weight = nn.Parameter(torch.ones((hidden_size,)))
         self.layer_norm_bias = nn.Parameter(torch.zeros((hidden_size,)))
         self.c_proj_weight = nn.Parameter(torch.rand(hidden_size, hidden_size))
@@ -64,10 +65,11 @@ class FusedAttention(nn.Module):
         residual = x
         x = fused_layer_norm(x, self.layer_norm_weight.data, self.layer_norm_bias.data)
         q, k, v = matmul_and_split_qkv(
-            x, self.c_attn_weight.data, self.c_attn_bias.data
+            x, self.c_attn_weight.data, self.c_attn_bias.data, self.num_heads
         )
         dropout_prob = self.dropout_prob if self.training else 0.0
         x = fused_attention(q, k, v, dropout_prob=dropout_prob)
+        x = x.transpose(1, 2).view(residual.shape)
         x = fused_ffn2(
             x,
             self.c_proj_weight.data,
