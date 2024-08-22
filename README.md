@@ -1,4 +1,4 @@
-tiny implementation of gpt/llama models in triton.
+triton implementation of gpt/llama models
 
 ```bash
 pip3 install -r requirements.txt
@@ -8,8 +8,8 @@ pip3 install -r requirements.txt
 
 ```python
 # you can run following command on CPU
-TRITON_INTERPRET=1 python3 test.py
+TRITON_INTERPRET=1 pytest -sv test.py
 
 # you can run following command on GPU
-python3 test.py
+pytest -sv test.py
 ```
