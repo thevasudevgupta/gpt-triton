@@ -1,86 +1,74 @@
-# TRITON_INTERPRET=1 python3 test.py
-
-import math
-from dataclasses import dataclass
-from typing import Optional
+# TRITON_INTERPRET=1 pytest -sv test.py
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import triton
-import triton.language as tl
 from transformers.activations import ACT2FN
 
-from ffn import ffn_kernel
-from layer_norm import fused_layer_norm
-from mlp import FusedMLP
-from utils import get_inputs
+from kernels import (flash_attention_v1, fused_embeddings, fused_ffn,
+                     fused_layer_norm)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-torch.manual_seed(1337)
-x = torch.rand((249, 121), device=device)
-mlp = FusedMLP(x.shape[1]).to(device)
-z = mlp(x)
-print(z.shape, z)
+def _get_inputs(M, K, N, device):
+    torch.manual_seed(1337)
+    x = torch.rand((M, K), device=device)
+    w = torch.rand((K, N), device=device)
+    b = torch.rand((N,), device=device)
+    r = torch.rand_like(x)
+    if K != N:
+        r = r_torch = None
+    return x, w, b, r
 
-M = 249
-K = 123
-N = 123
-BLOCK_SIZE_M = 32
-BLOCK_SIZE_N = 32
-BLOCK_SIZE_K = 16
 
-add_residual = True
-apply_layer_norm = True
+def test_fused_embeddings():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-x_torch, w_torch, b_torch = get_inputs(M, K, N, device=device)
-x, w, b = get_inputs(M, K, N, device=device)
+    x = torch.tensor(
+        [
+            [7, 10, 2, 0, 5, 3, 7, 10, 2, 0, 5, 3, 7, 10, 2, 0, 5, 3],
+            [14, 3, 1, 10, 2, 0, 14, 3, 1, 10, 14, 3, 1, 10, 14, 3, 1, 10],
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+    wte = torch.rand((16, 8), device=device)
+    wpe = torch.rand((20, 8), device=device)
 
-if add_residual:
-    assert K == N
-    r = x
-    r_torch = x_torch
-else:
-    r = r_torch = None
+    z_torch = wte[x] + wpe[torch.arange(x.shape[1], device=device)][None]
+    z = fused_embeddings(x, wte, wpe)
 
-if apply_layer_norm:
+    assert torch.allclose(z, z_torch, atol=1e-5), (z - z_torch).abs().max()
+
+
+def test_fused_layer_norm():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    M = 249
+    K = 123
+    N = 123
+    x, *_ = _get_inputs(M, K, N, device)
+    x_torch, *_ = _get_inputs(M, K, N, device)
+
     layer_norm = nn.LayerNorm(K).to(device)
     x_torch = layer_norm(x_torch)
     x = fused_layer_norm(x, layer_norm.weight.data, layer_norm.bias.data)
-    print("layer norm diff:", (x - x_torch).abs().max())
 
-z_torch = x_torch.to(torch.float16) @ w_torch.to(torch.float16)
-z_torch = ACT2FN["gelu_new"](z_torch.to(torch.float32) + b_torch)
+    assert torch.allclose(x, x_torch, atol=1e-5), (x - x_torch).abs().max()
 
-grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N), 1)
-z = torch.empty((M, N), device=device)
-ffn_kernel[grid](
-    x,
-    w,
-    z,
-    M,
-    N,
-    K,
-    apply_gelu=True,
-    dropout_prob=0.0,
-    b_ptr=b,
-    r_ptr=r,
-    BLOCK_SIZE_M=BLOCK_SIZE_M,
-    BLOCK_SIZE_N=BLOCK_SIZE_N,
-    BLOCK_SIZE_K=BLOCK_SIZE_K,
-)
 
-if add_residual:
-    z_torch += r_torch
+def test_fused_ffn():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print("diff:", (z - z_torch).abs().max())
-print(z)
-print(z_torch)
+    M = 199
+    K = 129
+    N = 129
+    x_torch, w_torch, b_torch, r_torch = _get_inputs(M, K, N, device)
+    x, w, b, r = _get_inputs(M, K, N, device)
 
-# implementation is inspired from flash-attn-v1 algo
-# TODO: read about flash-2 and see if we can switch to that
-# TODO: then read about flash-3 and see if we can switch to that instead
+    z_torch = x_torch @ w_torch
+    z_torch = ACT2FN["gelu_new"](z_torch + b_torch)
+    if r_torch is not None:
+        z_torch += r_torch
 
-# TODO: can we do score computation for only unmasked positions?
-# pytorch flex-attention does something like that - it would make computation 50% efficient
+    z = fused_ffn(x, w, bias=b, residual=r, add_gelu=True)
+
+    # TODO: how can we do better precision?
+    assert torch.allclose(z, z_torch, atol=9e-2), (z - z_torch).abs().max()
