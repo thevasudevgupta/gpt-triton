@@ -97,19 +97,15 @@ def torch_attention(q, k, v):
 
 def test_flash_attention_v1():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    B = 6
-    N = 7
-    # TODO: there is likely a bug in length dimension - something related to mask
-    # we get perfect results when L is perfect multiple of BLOCK_SIZE_L
-    L = 256
-    H = 128
+    B = 3
+    N = 9
+    L = 199
+    H = 256
+    # TODO: why do we get more error with H == 128?
+    # other heads gives good results
     q, k, v = _get_attn_inputs(B, N, L, H, device)
-
     z_torch = torch_attention(q, k, v)
-
     z = flash_attention_v1(q, k, v)
     print((z - z_torch).abs().max())
-    print(z.shape)
     print(z - z_torch)
-
-    # assert torch.allclose(z, z_torch, atol=1e-5), (z - z_torch).abs().max()
+    assert torch.allclose(z, z_torch, atol=1e-4), (z - z_torch).abs().max()

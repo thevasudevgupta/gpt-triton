@@ -145,6 +145,8 @@ def fused_layer_norm(x, weight, bias):
     return z
 
 
+# TODO: implement grouping for extra 10% speedup
+# also, need to understand what's gemm matmul
 @triton.jit
 def fused_ffn_kernel(
     x_ptr,
@@ -331,8 +333,6 @@ def matmul_and_split_qkv(x, weight, bias, num_heads):
 
 
 # TODO: does triton re-compile when different tl.constexpr is passed?
-
-
 # TODO: read about flash-2 and see if we can switch to that
 # TODO: then read about flash-3 and see if we can switch to that instead
 # TODO: can we do score computation for only unmasked positions?
@@ -413,8 +413,8 @@ def flash_attention_v1_kernel(
         # (BLOCK_SIZE_L, 1)
 
         if dropout_prob > 0.0:
-            # TODO: is it fine to pass qk instead of offset?
-            qk = dropout(qk, dropout_prob, seed, qk)
+            qk_offs = offs_lq[:, None] * Lk + offs_lk[None, :]
+            qk = dropout(qk, dropout_prob, seed, qk_offs)
 
         v = tl.load(v_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
