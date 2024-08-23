@@ -42,7 +42,7 @@ def fused_embeddings_kernel(
     H,
     dropout_prob=0.0,
     seed=1337,
-    BLOCK_SIZE: tl.constexpr = 16,
+    BLOCK_SIZE: tl.constexpr = 128,
 ):
     # f = dropout(wte(x) + wpe(x))
 
@@ -82,14 +82,24 @@ def fused_embeddings(x, wte, wpe, dropout_prob=0.0):
     z = torch.empty((B * L, H), device=x.device)
     grid = (z.shape[0],)
     fused_embeddings_kernel[grid](
-        x.view(-1), wte, wpe, z, B, L, V, P, H, dropout_prob=dropout_prob
+        x.view(-1),
+        wte,
+        wpe,
+        z,
+        B,
+        L,
+        V,
+        P,
+        H,
+        dropout_prob=dropout_prob,
+        BLOCK_SIZE=128,
     )
     return z.view((B, L, H))
 
 
 @triton.jit
 def fused_layer_norm_kernel(
-    x_ptr, w_ptr, b_ptr, z_ptr, H, eps=1e-5, BLOCK_SIZE: tl.constexpr = 16
+    x_ptr, w_ptr, b_ptr, z_ptr, H, eps=1e-5, BLOCK_SIZE: tl.constexpr = 128
 ):
     # f = ((x - mean) / (std + eps)) * w + b
     # x: (M, H)
@@ -166,9 +176,10 @@ def fused_ffn_kernel(
     apply_gelu=False,
     dropout_prob=0.0,
     seed=1337,
-    BLOCK_SIZE_M: tl.constexpr = 16,
-    BLOCK_SIZE_N: tl.constexpr = 16,
-    BLOCK_SIZE_K: tl.constexpr = 16,
+    cast_dtype_for_dot: tl.constexpr = True,
+    BLOCK_SIZE_M: tl.constexpr = 128,
+    BLOCK_SIZE_N: tl.constexpr = 128,
+    BLOCK_SIZE_K: tl.constexpr = 128,
 ):
     # f = dropout(gelu(x @ w + b)) + residual
     # launch with 2D grid of blocks along M & N directions
@@ -211,18 +222,16 @@ def fused_ffn_kernel(
     z = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_SIZE_K):
         x_k = tl.arange(0, BLOCK_SIZE_K)[None, :] + k
-        x = tl.load(
-            x_ptr + (offs_m % M) * K + x_k, mask=(offs_m < M) & (x_k < K), other=0.0
-        )
+        x = tl.load(x_ptr + offs_m * K + x_k, mask=(offs_m < M) & (x_k < K), other=0.0)
         # TODO: need to read why casting to fp16 is important here
-        x = x.to(tl.float16)
+        if cast_dtype_for_dot:
+            x = x.to(tl.float16)
         # (BLOCK_SIZE_M, BLOCK_SIZE_K)
 
         w_k = tl.arange(0, BLOCK_SIZE_K)[:, None] + k
-        w = tl.load(
-            w_ptr + w_k * N + (offs_n % N), mask=(w_k < K) & (offs_n < N), other=0.0
-        )
-        w = w.to(tl.float16)
+        w = tl.load(w_ptr + w_k * N + offs_n, mask=(w_k < K) & (offs_n < N), other=0.0)
+        if cast_dtype_for_dot:
+            w = w.to(tl.float16)
         # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         z = tl.dot(x, w, acc=z)
@@ -238,7 +247,7 @@ def fused_ffn_kernel(
 
     if apply_gelu:
         z = gelu_new(z)
-    if dropout_prob > 0:
+    if dropout_prob > 0.0:
         z = dropout(z, dropout_prob, seed, z_offset)
 
     if r_ptr is not None:
@@ -249,7 +258,15 @@ def fused_ffn_kernel(
 
 
 @torch.no_grad()
-def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=0.0):
+def fused_ffn(
+    x,
+    weight,
+    bias=None,
+    residual=None,
+    add_gelu=False,
+    dropout_prob=0.0,
+    cast_dtype_for_dot=True,
+):
     # x: (*, K)
     # weight: (K, N)
     # bias: (N,)
@@ -289,6 +306,7 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
         dropout_prob=dropout_prob,
         b_ptr=bias,
         r_ptr=residual,
+        cast_dtype_for_dot=cast_dtype_for_dot,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -303,7 +321,7 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
 #     pid_0 = tl.program_id(0)
 #     x_ptr += pid_0 * H
 #     z_ptr += pid_0 * H
-#     max_value, denominator = 0.0, 0.0
+#     max_value, denominator = 0., 0.
 #     for i in range(0, H, B1):
 #         offset = tl.arange(i, i + B1)
 #         x = tl.load(x_ptr + offset, mask=offset < H, other=0)
@@ -364,6 +382,7 @@ def flash_attention_v1_kernel(
     Lk,
     scale,
     H: tl.constexpr,
+    cast_dtype_for_dot: tl.constexpr = True,
     dropout_prob=0.0,
     seed=1337,
     BLOCK_SIZE_L: tl.constexpr = 128,
@@ -392,7 +411,8 @@ def flash_attention_v1_kernel(
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     # (BLOCK_SIZE_L, H)
 
-    q = q.to(tl.float16)
+    if cast_dtype_for_dot:
+        q = q.to(tl.float16)
 
     # loop over k, v and compute attention & weighted v
     z = tl.zeros((BLOCK_SIZE_L, H), dtype=tl.float32)
@@ -406,7 +426,8 @@ def flash_attention_v1_kernel(
         k = tl.load(k_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        k = k.to(tl.float16)
+        if cast_dtype_for_dot:
+            k = k.to(tl.float16)
         qk = tl.dot(q, k.trans(1, 0)) * scale
         # (BLOCK_SIZE_L, BLOCK_SIZE_L)
 
@@ -443,7 +464,11 @@ def flash_attention_v1_kernel(
         v = tl.load(v_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        z = tl.dot(qk.to(tl.float16), v.to(tl.float16), acc=z)
+        if cast_dtype_for_dot:
+            qk = qk.to(tl.float16)
+            v = v.to(tl.float16)
+
+        z = tl.dot(qk, v, acc=z)
         # (BLOCK_SIZE_L, H)
 
     z /= denominator
@@ -453,7 +478,7 @@ def flash_attention_v1_kernel(
 
 
 @torch.no_grad()
-def flash_attention_v1(q, k, v, dropout_prob=0.0):
+def flash_attention_v1(q, k, v, dropout_prob=0.0, cast_dtype_for_dot=True):
     # (batch_size, num_heads, seqlen, head_size)
     assert q.shape[:2] == k.shape[:2]
     assert q.shape[-1] == k.shape[-1]
@@ -497,6 +522,7 @@ def flash_attention_v1(q, k, v, dropout_prob=0.0):
         Lk,
         scale,
         H,
+        cast_dtype_for_dot=cast_dtype_for_dot,
         dropout_prob=dropout_prob,
         BLOCK_SIZE_L=BLOCK_SIZE_L,
     )

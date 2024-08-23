@@ -13,8 +13,11 @@ from kernels import (flash_attention_v1, fused_embeddings, fused_ffn,
 
 
 class FusedAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_prob=0.0):
+    def __init__(
+        self, hidden_size, num_heads, dropout_prob=0.0, cast_dtype_for_dot=True
+    ):
         super().__init__()
+        self.cast_dtype_for_dot = cast_dtype_for_dot
         self.dropout_prob = dropout_prob
         self.num_heads = num_heads
 
@@ -34,7 +37,13 @@ class FusedAttention(nn.Module):
             x, self.c_attn_weight.data, self.c_attn_bias.data, self.num_heads
         )
         dropout_prob = self.dropout_prob if self.training else 0.0
-        x = flash_attention_v1(q, k, v, dropout_prob=dropout_prob)
+        x = flash_attention_v1(
+            q,
+            k,
+            v,
+            dropout_prob=dropout_prob,
+            cast_dtype_for_dot=self.cast_dtype_for_dot,
+        )
         x = x.transpose(1, 2).contiguous().view(residual.shape)
         x = fused_ffn(
             x,
@@ -43,13 +52,15 @@ class FusedAttention(nn.Module):
             residual=residual,
             add_gelu=False,
             dropout_prob=dropout_prob,
+            cast_dtype_for_dot=self.cast_dtype_for_dot,
         )
         return x
 
 
 class FusedMLP(nn.Module):
-    def __init__(self, hidden_size, dropout_prob=0.0):
+    def __init__(self, hidden_size, dropout_prob=0.0, cast_dtype_for_dot=True):
         super().__init__()
+        self.cast_dtype_for_dot = cast_dtype_for_dot
         self.dropout_prob = dropout_prob
 
         self.layer_norm_weight = nn.Parameter(torch.ones((hidden_size,)))
@@ -75,6 +86,7 @@ class FusedMLP(nn.Module):
             residual=None,
             add_gelu=True,
             dropout_prob=dropout_prob,
+            cast_dtype_for_dot=self.cast_dtype_for_dot,
         )
         x = fused_ffn(
             x,
@@ -83,6 +95,7 @@ class FusedMLP(nn.Module):
             residual=residual,
             add_gelu=False,
             dropout_prob=dropout_prob,
+            cast_dtype_for_dot=self.cast_dtype_for_dot,
         )
         return x
 
@@ -98,8 +111,9 @@ class GPTConfig:
 
 
 class FusedGPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, cast_dtype_for_dot=True):
         super().__init__()
+        self.cast_dtype_for_dot = cast_dtype_for_dot
         self.config = config
 
         self.wte_weight = nn.Parameter(torch.rand(config.vocab_size, config.n_embd))
@@ -109,9 +123,16 @@ class FusedGPT(nn.Module):
             [
                 nn.Sequential(
                     FusedAttention(
-                        config.n_embd, config.n_head, dropout_prob=config.dropout
+                        config.n_embd,
+                        config.n_head,
+                        dropout_prob=config.dropout,
+                        cast_dtype_for_dot=cast_dtype_for_dot,
                     ),
-                    FusedMLP(config.n_embd, dropout_prob=config.dropout),
+                    FusedMLP(
+                        config.n_embd,
+                        dropout_prob=config.dropout,
+                        cast_dtype_for_dot=cast_dtype_for_dot,
+                    ),
                 )
                 for _ in range(config.n_layer)
             ]
@@ -139,6 +160,7 @@ class FusedGPT(nn.Module):
         #     residual=None,
         #     add_gelu=False,
         #     dropout_prob=0.0,
+        #     cast_dtype_for_dot=self.cast_dtype_for_dot,
         # )
         return x
 
@@ -184,11 +206,11 @@ def convert_huggingface_to_triton(hf_sd, hf_config):
     return sd, config
 
 
-def convert_hf_and_load_model(model_id, device):
-    hf_model = HFGPT2.from_pretrained(model_id).eval()
+def convert_hf_and_load_model(model_id, device, cast_dtype_for_dot=True):
+    hf_model = HFGPT2.from_pretrained(model_id)
     state_dict, config = convert_huggingface_to_triton(
         hf_model.state_dict(), hf_model.config
     )
-    model = FusedGPT(config).eval()
+    model = FusedGPT(config, cast_dtype_for_dot=cast_dtype_for_dot)
     model.load_state_dict(state_dict)
-    return model.to(device), hf_model.to(device)
+    return model.to(device).eval(), hf_model.to(device).eval()
