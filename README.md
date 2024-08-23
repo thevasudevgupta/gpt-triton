@@ -5,6 +5,7 @@ Supported Features
 * [x] flash attention v1 algorithm
 * [x] GPT2 implementation in triton
 * [x] support for loading pre-trained weights of huggingface-gpt2
+* [ ] support KV cache & sampling for inference loop
 * [ ] implement back-propogation of GPT block in triton (i.e. solving the math problem).
 * [ ] implement paged-attention from vLLM project in triton.
 * [ ] implement flash attention v2 & v3.
