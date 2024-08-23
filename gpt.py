@@ -18,18 +18,14 @@ class FusedAttention(nn.Module):
         self.dropout_prob = dropout_prob
         self.num_heads = num_heads
 
-        self.layer_norm_weight = nn.Parameter(torch.ones((hidden_size,)))
-        self.layer_norm_bias = nn.Parameter(torch.zeros((hidden_size,)))
+        self.layer_norm_weight = nn.Parameter(torch.ones(hidden_size))
+        self.layer_norm_bias = nn.Parameter(torch.zeros(hidden_size))
 
         self.c_attn_weight = nn.Parameter(torch.rand(hidden_size, 3 * hidden_size))
-        self.c_attn_bias = nn.Parameter(torch.rand((3 * hidden_size,)))
+        self.c_attn_bias = nn.Parameter(torch.rand(3 * hidden_size))
 
         self.c_proj_weight = nn.Parameter(torch.rand(hidden_size, hidden_size))
-        self.c_proj_bias = nn.Parameter(
-            torch.rand(
-                hidden_size,
-            )
-        )
+        self.c_proj_bias = nn.Parameter(torch.rand(hidden_size))
 
     def forward(self, x):
         residual = x
@@ -62,11 +58,7 @@ class FusedMLP(nn.Module):
         intermediate_size = 4 * hidden_size
 
         self.ffn1_weight = nn.Parameter(torch.rand(hidden_size, intermediate_size))
-        self.ffn1_bias = nn.Parameter(
-            torch.rand(
-                intermediate_size,
-            )
-        )
+        self.ffn1_bias = nn.Parameter(torch.rand(intermediate_size))
 
         self.ffn2_weight = nn.Parameter(torch.rand(intermediate_size, hidden_size))
         self.ffn2_bias = nn.Parameter(torch.rand(hidden_size))
@@ -188,28 +180,37 @@ def convert_huggingface_to_triton(hf_sd, hf_config):
             mapping[k.format(i=i)] = v.format(i=i)
     sd = {}
     for k, v in tqdm(hf_sd.items()):
-        k = mapping[k]
-        sd[k] = v
+        sd[mapping[k]] = v
     return sd, config
 
 
+def convert_hf_and_load_model(model_id):
+    hf_model = HFGPT2.from_pretrained(model_id).eval()
+    state_dict, config = convert_huggingface_to_triton(
+        hf_model.state_dict(), hf_model.config
+    )
+    model = FusedGPT(config).eval()
+    model.load_state_dict(state_dict)
+    return model, hf_model
+
+
 model_id = "gpt2"
+model, hf_model = convert_hf_and_load_model(model_id)
 tokenizer = AutoTokenizer.from_pretrained(model_id)
-hf_model = HFGPT2.from_pretrained(model_id).eval()
-state_dict, config = convert_huggingface_to_triton(
-    hf_model.state_dict(), hf_model.config
-)
-model = FusedGPT(config).eval()
-model.load_state_dict(state_dict)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model.to(device)
+hf_model.to(device)
 
 with torch.no_grad():
     string = "I am vasudev gupta. I like AI."
     inputs = tokenizer(string, return_tensors="pt")
-    print(inputs)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     hf_out = hf_model(**inputs).last_hidden_state
     out = model(inputs["input_ids"])
     print((out - hf_out).abs().max())
-
+    print((out - hf_out).abs())
     import ipdb
 
     ipdb.set_trace()
