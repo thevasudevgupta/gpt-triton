@@ -21,6 +21,8 @@ def gelu_new(x):
     return 0.5 * x * (1.0 + tanh(a * b))
 
 
+# TODO: fixed seed would hurt the performance
+# but how do we modify seed design wise?
 @triton.jit
 def dropout(x, p, seed, offset):
     random = tl.rand(seed, offset)
@@ -328,6 +330,9 @@ def matmul_and_split_qkv(x, weight, bias, num_heads):
     return q, k, v
 
 
+# TODO: does triton re-compile when different tl.constexpr is passed?
+
+
 # TODO: read about flash-2 and see if we can switch to that
 # TODO: then read about flash-3 and see if we can switch to that instead
 # TODO: can we do score computation for only unmasked positions?
@@ -339,38 +344,34 @@ def flash_attention_v1_kernel(
     v_ptr,
     z_ptr,
     BN,
-    L,
-    H,
+    Lq,
+    Lk,
+    H: tl.constexpr,
     dropout_prob=0.0,
     seed=1337,
-    BLOCK_SIZE_BN: tl.constexpr = 128,
     BLOCK_SIZE_L: tl.constexpr = 128,
 ):
     # f = (q @ k.T) / math.sqrt(head_size)
     # f = dropout(F.softmax(apply_causal_mask(f), dim=-1))
     # f = f @ v
 
-    # q, k, v, z: (B * N, L, H)
-    # TODO: implement causal mask?
+    # q, z: (B * N, Lq, H)
+    # k, v: (B * N, Lk, H)
 
-    pid_bn = tl.program_id(0)
-    offs_bn = pid_bn * BLOCK_SIZE_BN * (L * H)
-    q_ptr += offs_bn
-    k_ptr += offs_bn
-    v_ptr += offs_bn
-    z_ptr += offs_bn
+    q_ptr += tl.program_id(0) * (Lq * H)
+    z_ptr += tl.program_id(0) * (Lq * H)
+    k_ptr += tl.program_id(0) * (Lk * H)
+    v_ptr += tl.program_id(0) * (Lk * H)
 
     # assuming that `H` can stay SRAM fully and doesn't require blocking
     # this assumptions was made for original implementation of flash attention as well
     # its reasonable as most of LLMs use head size <= 256
-    pid_l = tl.program_id(1)
-    offs_l = pid_l * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)[:, None]
-    offs_h = tl.arange(0, H)[None, :]
+    offs_lq = tl.program_id(1) * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)
+    offs_h = tl.arange(0, H)
 
-    q_mask = offs_l < L
+    q_mask = offs_lq[:, None] < Lq
+    q_offs = offs_lq[:, None] * H + offs_h[None, :]
     # this remains in sram throughtout computation
-    q_offs = offs_l * H + offs_h
-
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     # (BLOCK_SIZE_L, H)
 
@@ -378,17 +379,20 @@ def flash_attention_v1_kernel(
     z = tl.zeros((BLOCK_SIZE_L, H), dtype=tl.float32)
     max_value = tl.zeros((BLOCK_SIZE_L, 1), dtype=tl.float32) + float("-inf")
     denominator = tl.zeros((BLOCK_SIZE_L, 1), dtype=tl.float32)
-    for i in range(0, L, BLOCK_SIZE_L):
+    for i in range(0, Lk, BLOCK_SIZE_L):
+        offs_lk = i + tl.arange(0, BLOCK_SIZE_L)
+        kv_mask = offs_lk[:, None] < Lk
+        kv_offs = offs_lk[:, None] * H + offs_h[None, :]
 
-        mask = (i + tl.arange(0, BLOCK_SIZE_L)[:, None]) < L
-        offs = (i + tl.arange(0, BLOCK_SIZE_L)[:, None]) * H + tl.arange(0, H)[None, :]
-
-        k = tl.load(k_ptr + offs, mask=mask, other=0.0)
+        k = tl.load(k_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        qk = tl.dot(q, k.trans(1, 0))
-        qk /= tl.sqrt(H)
+        qk = tl.dot(q, k.trans(1, 0)) / tl.sqrt(H)
         # (BLOCK_SIZE_L, BLOCK_SIZE_L)
+
+        # apply causal mask ; we still compute the attention over the future blocks
+        # we wanna optimise that eventually
+        qk = tl.where(offs_lq[:, None] >= offs_lk[None, :], qk, float("-inf"))
 
         block_max_value = tl.max(qk, axis=1, keep_dims=True)
         # (BLOCK_SIZE_L, 1)
@@ -412,37 +416,53 @@ def flash_attention_v1_kernel(
             # TODO: is it fine to pass qk instead of offset?
             qk = dropout(qk, dropout_prob, seed, qk)
 
-        v = tl.load(v_ptr + offs, mask=mask, other=0.0)
+        v = tl.load(v_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
         z = tl.dot(qk, v, acc=z)
         # (BLOCK_SIZE_L, H)
 
-    z /= denominator
-    tl.store(z_ptr + q_offs, z, mask=q_mask)
+    tl.store(z_ptr + q_offs, z / denominator, mask=q_mask)
 
 
 @torch.no_grad()
-def flash_attention_v1(q, k, v):
+def flash_attention_v1(q, k, v, dropout_prob=0.0):
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
-    assert q.shape == k.shape == v.shape
-    B, N, L, H = q.shape
+    assert q.shape[:2] == k.shape[:2]
+    assert q.shape[-1] == k.shape[-1]
+    assert k.shape == v.shape
+    # B: batch_size
+    # N: num_heads
+    # L: seqlen
+    # H: head_size
+    B, N, Lq, H = q.shape
+    Lk = k.shape[2]
 
-    BLOCK_SIZE_BN = 128
     BLOCK_SIZE_L = 128
 
-    # TODO: try to run without this constraint and see if we get errors
-    # assert head_size <= 256
+    assert H in {16, 32, 64, 128, 256}
     # above condition is necessary because shared memory is limited
     # and we don't do additional blocking over head_size dim
 
-    grid = (triton.cdiv(B * N, BLOCK_SIZE_BN), triton.cdiv(L, BLOCK_SIZE_L), 1)
+    q = q.view(B * N, Lq, H)
+    z = torch.empty_like(q)
+    k = k.view(B * N, Lk, H)
+    v = v.view(B * N, Lk, H)
+
+    grid = (B * N, triton.cdiv(Lq, BLOCK_SIZE_L), 1)
     flash_attention_v1_kernel[grid](
-        q.view(B * N, L, H),
-        k.view(B * N, L, H),
-        v.view(B * N, L, H),
+        q,
+        k,
+        v,
+        z,
+        B * N,
+        Lq,
+        Lk,
+        H,
+        dropout_prob=dropout_prob,
+        BLOCK_SIZE_L=BLOCK_SIZE_L,
     )
 
-    return z.view(B, N, L, H)
+    return z.view(B, N, Lq, H)
