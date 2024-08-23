@@ -1,4 +1,13 @@
-triton implementation of gpt/llama models
+Triton implementation of GPT/LLAMA models. Objective of this project is to understand how much performance can be squeezed out if we implement full-GPT-block in one triton kernel.
+
+Supported Features
+* [x] fused implementation of several components of GPT block (for eg: `dropout(wte(x) + wpe(x))`, `dropout(wx + b)`, `gelu(wx + b)`)
+* [x] flash attention v1 algorithm
+* [x] GPT2 implementation in triton
+* [x] support for loading pre-trained weights of huggingface-gpt2
+* [ ] implement back-propogation of GPT block in triton (i.e. solving the math problem).
+* [ ] implement paged-attention from vLLM project in triton.
+* [ ] implement flash attention v2 & v3.
 
 **Installation**
 
@@ -17,7 +26,3 @@ TRITON_INTERPRET=1 pytest -sv test.py
 # you can run following command on GPU
 pytest -sv test.py
 ```
-
-Objective of this repo is following:
-* find out how much performance improvement we can squeeze out if we implement full GPT block in single triton kernel
-* eventually, wanna find out if we can do the back-propogation of GPT block manually and optimise the memory requirements (i.e. solving the math problem)
