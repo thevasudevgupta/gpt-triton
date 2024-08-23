@@ -39,7 +39,7 @@ def fused_embeddings_kernel(
     L,
     V,
     P,
-    N,
+    H,
     dropout_prob=0.0,
     seed=1337,
     BLOCK_SIZE: tl.constexpr = 16,
@@ -47,18 +47,18 @@ def fused_embeddings_kernel(
     # f = dropout(wte(x) + wpe(x))
 
     # x: (B*S,)
-    # wte: (V, N)
-    # wpe: (P, N)
-    # z: (B*S, N)
+    # wte: (V, H)
+    # wpe: (P, H)
+    # z: (B*S, H)
 
     pid = tl.program_id(0)
-    wte_ptr += tl.load(x_ptr + pid) * N
-    wpe_ptr += (pid % L) * N
-    z_ptr += pid * N
+    wte_ptr += tl.load(x_ptr + pid) * H
+    wpe_ptr += (pid % L) * H
+    z_ptr += pid * H
 
-    for k in range(0, N, BLOCK_SIZE):
+    for k in range(0, H, BLOCK_SIZE):
         offset = k + tl.arange(0, BLOCK_SIZE)
-        mask = offset < N
+        mask = offset < H
 
         z = tl.load(wte_ptr + offset, mask=mask, other=0.0)
         z += tl.load(wpe_ptr + offset, mask=mask, other=0.0)
@@ -69,56 +69,57 @@ def fused_embeddings_kernel(
 
 @torch.no_grad()
 def fused_embeddings(x, wte, wpe, dropout_prob=0.0):
-    B, L = x.shape
-    V, N = wte.shape
-    P = wpe.shape[0]
+    # x: (batch_size, seqlen)
+    # wte: (vocab_size, hidden_size)
+    # wpe: (block_size, hidden_size)
     assert wte.shape[1] == wpe.shape[1]
     assert x.is_contiguous()
     assert wte.is_contiguous()
     assert wpe.is_contiguous()
-
-    z = torch.empty((B * L, N), device=x.device)
+    B, L = x.shape
+    V, H = wte.shape
+    P = wpe.shape[0]
+    z = torch.empty((B * L, H), device=x.device)
     grid = (z.shape[0],)
     fused_embeddings_kernel[grid](
-        x.view(-1), wte, wpe, z, B, L, V, P, N, dropout_prob=dropout_prob
+        x.view(-1), wte, wpe, z, B, L, V, P, H, dropout_prob=dropout_prob
     )
-
-    return z.view((B, L, N))
+    return z.view((B, L, H))
 
 
 @triton.jit
 def fused_layer_norm_kernel(
-    x_ptr, w_ptr, b_ptr, z_ptr, N, eps=1e-5, BLOCK_SIZE: tl.constexpr = 16
+    x_ptr, w_ptr, b_ptr, z_ptr, H, eps=1e-5, BLOCK_SIZE: tl.constexpr = 16
 ):
     # f = ((x - mean) / (std + eps)) * w + b
-    # x: (M, N)
+    # x: (M, H)
     # launch with 1D grid along M direction
 
     row_id = tl.program_id(0)
-    x_ptr += row_id * N
-    z_ptr += row_id * N
+    x_ptr += row_id * H
+    z_ptr += row_id * H
 
     x_mean = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for i in range(0, N, BLOCK_SIZE):
+    for i in range(0, H, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(x_ptr + offset, mask=(offset < N), other=0.0)
+        x = tl.load(x_ptr + offset, mask=(offset < H), other=0.0)
         x_mean += x.to(tl.float32)
-    x_mean = tl.sum(x_mean) / N
+    x_mean = tl.sum(x_mean) / H
 
     x_var = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-    for i in range(0, N, BLOCK_SIZE):
+    for i in range(0, H, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(x_ptr + offset, mask=(offset < N), other=x_mean)
+        x = tl.load(x_ptr + offset, mask=(offset < H), other=x_mean)
         x = x.to(tl.float32)
         x_var += (x - x_mean) * (x - x_mean)
-    x_var = tl.sum(x_var) / N
+    x_var = tl.sum(x_var) / H
     rstd = 1 / tl.sqrt(x_var + eps)
 
     # TODO: we could prevent this extra loop if we fuse it in ffn block?
     # but thats quite hacky - so, lets move with extra loop for now
-    for i in range(0, N, BLOCK_SIZE):
+    for i in range(0, H, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
-        mask = offset < N
+        mask = offset < H
 
         x = tl.load(x_ptr + offset, mask=mask, other=0.0)
         w = tl.load(w_ptr + offset, mask=mask, other=0.0)
@@ -132,17 +133,22 @@ def fused_layer_norm_kernel(
 
 @torch.no_grad()
 def fused_layer_norm(x, weight, bias):
+    # x: (*, hidden_size)
+    # weight: (hidden_size,)
+    # bias: (hidden_size,)
     assert x.is_contiguous()
     assert weight.is_contiguous()
     assert bias.is_contiguous()
     assert weight.shape == bias.shape
     assert x.shape[-1] == weight.shape[0]
-    M, N = x.shape
+    out_shape = x.shape
+    x = x.view((-1, x.shape[-1]))
+    B, H = x.shape
     BLOCK_SIZE = 128
+    x = x.view((B, H))
     z = torch.empty(x.shape, device=x.device)
-    grid = (M,)
-    fused_layer_norm_kernel[grid](x, weight, bias, z, N, BLOCK_SIZE=BLOCK_SIZE)
-    return z
+    fused_layer_norm_kernel[(B,)](x, weight, bias, z, H, BLOCK_SIZE=BLOCK_SIZE)
+    return z.view(out_shape)
 
 
 # TODO: implement grouping for extra 10% speedup
@@ -244,10 +250,18 @@ def fused_ffn_kernel(
 
 @torch.no_grad()
 def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=0.0):
+    # x: (*, K)
+    # weight: (K, N)
+    # bias: (N,)
     # f = dropout(gelu(x @ w + b)) + residual
+
+    out_shape_0 = x.shape[:-1]
+    x = x.view((-1, x.shape[-1]))
 
     M, K = x.shape
     N = weight.shape[1]
+
+    x = x.view((M, K))
     z = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
     assert x.is_contiguous()
@@ -257,14 +271,12 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
         assert bias.is_contiguous()
         assert weight.shape[1] == bias.shape[0]
     if residual is not None:
+        residual = residual.view(z.shape)
         assert residual.is_contiguous()
-        assert residual.shape == z.shape
 
-    BLOCK_SIZE_M = min(16, M)
-    BLOCK_SIZE_N = min(16, N)
-    BLOCK_SIZE_K = min(16, K)
-    assert BLOCK_SIZE_K >= 16, "triton doesn't support block size < 16"
-
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 256
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N), 1)
     fused_ffn_kernel[grid](
         x,
@@ -281,7 +293,7 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
-    return z
+    return z.view((*out_shape_0, N))
 
 
 # @triton.jit
@@ -316,16 +328,20 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
 @torch.no_grad()
 def matmul_and_split_qkv(x, weight, bias, num_heads):
     # x: (batch_size, seqlen, hidden_size)
-    x = fused_ffn1(x, weight, bias, add_gelu=False)
+    x = fused_ffn(x, weight, bias=bias)
     # (batch_size, seqlen, 3 * hidden_size)
-    q, k, v = x.split(self.n_embd, dim=2)
-    batch_size, seqlen, hidden_size = q.shape
-    assert hidden_size % head_size == 0
-    head_size = head_size // num_heads
+    batch_size, seqlen, hidden_size = x.shape
+    assert hidden_size % 3 == 0, hidden_size
+    hidden_size = hidden_size // 3
+    q, k, v = x.split(hidden_size, dim=2)
+    assert hidden_size % num_heads == 0, (hidden_size, num_heads)
+    head_size = hidden_size // num_heads
     # (batch_size, seqlen, num_heads, head_size)
     # TODO: following is unecessary read & write - memory bound operation
     q, k, v = map(
-        lambda x: x.view(batch_size, seqlen, num_heads, head_size).transpose(1, 2),
+        lambda x: x.view(batch_size, seqlen, num_heads, head_size)
+        .transpose(1, 2)
+        .contiguous(),
         (q, k, v),
     )
     # (batch_size, num_heads, seqlen, head_size)
@@ -427,6 +443,7 @@ def flash_attention_v1_kernel(
 
 @torch.no_grad()
 def flash_attention_v1(q, k, v, dropout_prob=0.0):
+    # (batch_size, num_heads, seqlen, head_size)
     assert q.is_contiguous()
     assert k.is_contiguous()
     assert v.is_contiguous()
