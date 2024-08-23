@@ -276,7 +276,7 @@ def fused_ffn(x, weight, bias=None, residual=None, add_gelu=False, dropout_prob=
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 256
+    BLOCK_SIZE_K = 128
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N), 1)
     fused_ffn_kernel[grid](
         x,
@@ -362,6 +362,7 @@ def flash_attention_v1_kernel(
     BN,
     Lq,
     Lk,
+    scale,
     H: tl.constexpr,
     dropout_prob=0.0,
     seed=1337,
@@ -391,6 +392,8 @@ def flash_attention_v1_kernel(
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     # (BLOCK_SIZE_L, H)
 
+    q = q.to(tl.float16)
+
     # loop over k, v and compute attention & weighted v
     z = tl.zeros((BLOCK_SIZE_L, H), dtype=tl.float32)
     max_value = tl.zeros((BLOCK_SIZE_L, 1), dtype=tl.float32) + float("-inf")
@@ -403,8 +406,13 @@ def flash_attention_v1_kernel(
         k = tl.load(k_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        qk = tl.dot(q, k.trans(1, 0)) / tl.sqrt(H)
+        k = k.to(tl.float16)
+        qk = tl.dot(q, k.trans(1, 0)) * scale
         # (BLOCK_SIZE_L, BLOCK_SIZE_L)
+
+        # TODO: remove eventually, its for debugging
+        # qk_offs = offs_lq[:, None] * Lk + offs_lk[None, :]
+        # tl.store(z_ptr + qk_offs, qk)
 
         # apply causal mask ; we still compute the attention over the future blocks
         # we wanna optimise that eventually
@@ -435,18 +443,18 @@ def flash_attention_v1_kernel(
         v = tl.load(v_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        z = tl.dot(qk, v, acc=z)
+        z = tl.dot(qk.to(tl.float16), v.to(tl.float16), acc=z)
         # (BLOCK_SIZE_L, H)
 
-    tl.store(z_ptr + q_offs, z / denominator, mask=q_mask)
+    z /= denominator
+    z = z.to(z_ptr.dtype.element_ty)
+
+    tl.store(z_ptr + q_offs, z, mask=q_mask)
 
 
 @torch.no_grad()
 def flash_attention_v1(q, k, v, dropout_prob=0.0):
     # (batch_size, num_heads, seqlen, head_size)
-    assert q.is_contiguous()
-    assert k.is_contiguous()
-    assert v.is_contiguous()
     assert q.shape[:2] == k.shape[:2]
     assert q.shape[-1] == k.shape[-1]
     assert k.shape == v.shape
@@ -464,9 +472,19 @@ def flash_attention_v1(q, k, v, dropout_prob=0.0):
     # and we don't do additional blocking over head_size dim
 
     q = q.view(B * N, Lq, H)
-    z = torch.empty_like(q)
     k = k.view(B * N, Lk, H)
     v = v.view(B * N, Lk, H)
+
+    z = torch.empty_like(q)
+
+    # z = torch.rand((B * N, Lq, Lk), dtype=q.dtype, device=q.device)
+
+    assert q.is_contiguous()
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert z.is_contiguous()
+
+    scale = 1 / math.sqrt(H)
 
     grid = (B * N, triton.cdiv(Lq, BLOCK_SIZE_L), 1)
     flash_attention_v1_kernel[grid](
@@ -477,9 +495,9 @@ def flash_attention_v1(q, k, v, dropout_prob=0.0):
         B * N,
         Lq,
         Lk,
+        scale,
         H,
         dropout_prob=dropout_prob,
         BLOCK_SIZE_L=BLOCK_SIZE_L,
     )
-
     return z.view(B, N, Lq, H)
