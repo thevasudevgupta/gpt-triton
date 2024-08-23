@@ -184,32 +184,11 @@ def convert_huggingface_to_triton(hf_sd, hf_config):
     return sd, config
 
 
-def convert_hf_and_load_model(model_id):
+def convert_hf_and_load_model(model_id, device):
     hf_model = HFGPT2.from_pretrained(model_id).eval()
     state_dict, config = convert_huggingface_to_triton(
         hf_model.state_dict(), hf_model.config
     )
     model = FusedGPT(config).eval()
     model.load_state_dict(state_dict)
-    return model, hf_model
-
-
-model_id = "gpt2"
-model, hf_model = convert_hf_and_load_model(model_id)
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-model.to(device)
-hf_model.to(device)
-
-with torch.no_grad():
-    string = "I am vasudev gupta. I like AI."
-    inputs = tokenizer(string, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    hf_out = hf_model(**inputs).last_hidden_state
-    out = model(inputs["input_ids"])
-    print((out - hf_out).abs().max())
-    print((out - hf_out).abs())
-    # import ipdb
-    # ipdb.set_trace()
+    return model.to(device), hf_model.to(device)

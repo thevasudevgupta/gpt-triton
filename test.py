@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
+from gpt import FusedGPT, convert_hf_and_load_model
 from kernels import (flash_attention_v1, fused_embeddings, fused_ffn,
                      fused_layer_norm)
 
@@ -109,3 +110,19 @@ def test_flash_attention_v1():
     print((z - z_torch).abs().max())
     print(z - z_torch)
     assert torch.allclose(z, z_torch, atol=1e-4), (z - z_torch).abs().max()
+
+
+def test_gpt2():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_id = "gpt2"
+    model, hf_model = convert_hf_and_load_model(model_id, device)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    with torch.no_grad():
+        string = "I am vasudev gupta. I like AI."
+        inputs = tokenizer(string, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        hf_out = hf_model(**inputs).last_hidden_state
+        out = model(inputs["input_ids"])
+        print((out - hf_out).abs().max())
+        print((out - hf_out).abs())
