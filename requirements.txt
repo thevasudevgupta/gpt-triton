@@ -3,3 +3,4 @@ transformers
 numpy<2.0.0
 black
 isort
+ipdb
