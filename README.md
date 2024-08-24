@@ -24,6 +24,7 @@ python3 bench.py
 * [ ] implement paged-attention from vLLM project in triton
 * [ ] implement flash attention v2 & v3
 * [ ] add kernels for LLAMA-3.1
+* [ ] implement adamw in triton (with FSDP-stage2 support)
 
 **Installation**
 
