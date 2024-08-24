@@ -1,6 +1,20 @@
 Triton implementation of GPT/LLAMA models. Objective of this project is to understand how much performance can be squeezed out if we implement full-GPT-block in one triton kernel.
 
-Supported Features
+**Performance**
+
+triton implementation is 2x faster and 4x memory efficient compared to HuggingFace Transformers implementation.
+
+```bash
+python3 bench.py
+
+# 1 A100 40 GB
+# torch: batch_size = 512 && t = 1801.32
+# triton: batch_size = 512 && t = 789.14
+# torch: batch_size = 1024 && OOM
+# triton: batch_size = 2048 && t = 3153.70
+```
+
+**Supported Features**
 * [x] fused implementation of several components of GPT block (for eg: `dropout(wte(x) + wpe(x))`, `dropout(wx + b)`, `gelu(wx + b)`)
 * [x] flash attention v1 algorithm
 * [x] GPT2 implementation in triton
