@@ -83,8 +83,7 @@ def test_fused_ffn(M, N, K, add_gelu, add_bias):
 
     z_torch = torch_ffn(x_torch, w_torch, b=b_torch, r=r_torch)
 
-    # TODO: tests won't pass if `cast_dtype_for_dot=True` - its likely issue with triton
-    z = fused_ffn(x, w, bias=b, residual=r, add_gelu=True, cast_dtype_for_dot=False)
+    z = fused_ffn(x, w, bias=b, residual=r, add_gelu=True)
     assert torch.allclose(z, z_torch, atol=1e-5), (z - z_torch).abs().max()
 
 
@@ -114,17 +113,14 @@ def test_flash_attention_v1(B, N, L, H):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     q, k, v = _get_attn_inputs(B, N, L, H, device)
     z_torch = torch_attention(q, k, v)
-    # TODO: tests won't pass if `cast_dtype_for_dot=True` - its likely issue with triton
-    z = flash_attention_v1(q, k, v, cast_dtype_for_dot=False)
+    z = flash_attention_v1(q, k, v)
     assert torch.allclose(z, z_torch, atol=1e-5), (z - z_torch).abs().max()
 
 
 def test_gpt2():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_id = "gpt2"
-    model, hf_model = convert_hf_and_load_model(
-        model_id, device, cast_dtype_for_dot=False
-    )
+    model, hf_model = convert_hf_and_load_model(model_id, device)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     with torch.no_grad():
         string = "I am vasudev gupta. I like AI."

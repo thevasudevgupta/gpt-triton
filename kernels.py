@@ -92,7 +92,6 @@ def fused_embeddings(x, wte, wpe, dropout_prob=0.0):
         P,
         H,
         dropout_prob=dropout_prob,
-        BLOCK_SIZE=128,
     )
     return z.view((B, L, H))
 
@@ -154,10 +153,9 @@ def fused_layer_norm(x, weight, bias):
     out_shape = x.shape
     x = x.view((-1, x.shape[-1]))
     B, H = x.shape
-    BLOCK_SIZE = 128
     x = x.view((B, H))
     z = torch.empty(x.shape, device=x.device)
-    fused_layer_norm_kernel[(B,)](x, weight, bias, z, H, BLOCK_SIZE=BLOCK_SIZE)
+    fused_layer_norm_kernel[(B,)](x, weight, bias, z, H)
     return z.view(out_shape)
 
 
@@ -176,7 +174,6 @@ def fused_ffn_kernel(
     apply_gelu=False,
     dropout_prob=0.0,
     seed=1337,
-    cast_dtype_for_dot: tl.constexpr = True,
     BLOCK_SIZE_M: tl.constexpr = 128,
     BLOCK_SIZE_N: tl.constexpr = 128,
     BLOCK_SIZE_K: tl.constexpr = 128,
@@ -224,14 +221,12 @@ def fused_ffn_kernel(
         x_k = tl.arange(0, BLOCK_SIZE_K)[None, :] + k
         x = tl.load(x_ptr + offs_m * K + x_k, mask=(offs_m < M) & (x_k < K), other=0.0)
         # TODO: need to read why casting to fp16 is important here
-        if cast_dtype_for_dot:
-            x = x.to(tl.float16)
+        # x = x.to(tl.float16)
         # (BLOCK_SIZE_M, BLOCK_SIZE_K)
 
         w_k = tl.arange(0, BLOCK_SIZE_K)[:, None] + k
         w = tl.load(w_ptr + w_k * N + offs_n, mask=(w_k < K) & (offs_n < N), other=0.0)
-        if cast_dtype_for_dot:
-            w = w.to(tl.float16)
+        # w = w.to(tl.float16)
         # (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
         z = tl.dot(x, w, acc=z)
@@ -265,7 +260,6 @@ def fused_ffn(
     residual=None,
     add_gelu=False,
     dropout_prob=0.0,
-    cast_dtype_for_dot=True,
 ):
     # x: (*, K)
     # weight: (K, N)
@@ -291,9 +285,10 @@ def fused_ffn(
         residual = residual.view(z.shape)
         assert residual.is_contiguous()
 
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
+    # (128, 128, 64) doesn't work and leads to 6x slowdown?
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_K = 64
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N), 1)
     fused_ffn_kernel[grid](
         x,
@@ -306,7 +301,6 @@ def fused_ffn(
         dropout_prob=dropout_prob,
         b_ptr=bias,
         r_ptr=residual,
-        cast_dtype_for_dot=cast_dtype_for_dot,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
@@ -382,7 +376,6 @@ def flash_attention_v1_kernel(
     Lk,
     scale,
     H: tl.constexpr,
-    cast_dtype_for_dot: tl.constexpr = True,
     dropout_prob=0.0,
     seed=1337,
     BLOCK_SIZE_L: tl.constexpr = 128,
@@ -411,8 +404,7 @@ def flash_attention_v1_kernel(
     q = tl.load(q_ptr + q_offs, mask=q_mask, other=0.0)
     # (BLOCK_SIZE_L, H)
 
-    if cast_dtype_for_dot:
-        q = q.to(tl.float16)
+    # q = q.to(tl.float16)
 
     # loop over k, v and compute attention & weighted v
     z = tl.zeros((BLOCK_SIZE_L, H), dtype=tl.float32)
@@ -426,8 +418,7 @@ def flash_attention_v1_kernel(
         k = tl.load(k_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        if cast_dtype_for_dot:
-            k = k.to(tl.float16)
+        # k = k.to(tl.float16)
         qk = tl.dot(q, k.trans(1, 0)) * scale
         # (BLOCK_SIZE_L, BLOCK_SIZE_L)
 
@@ -464,9 +455,8 @@ def flash_attention_v1_kernel(
         v = tl.load(v_ptr + kv_offs, mask=kv_mask, other=0.0)
         # (BLOCK_SIZE_L, H)
 
-        if cast_dtype_for_dot:
-            qk = qk.to(tl.float16)
-            v = v.to(tl.float16)
+        # qk = qk.to(tl.float16)
+        # v = v.to(tl.float16)
 
         z = tl.dot(qk, v, acc=z)
         # (BLOCK_SIZE_L, H)
@@ -478,7 +468,7 @@ def flash_attention_v1_kernel(
 
 
 @torch.no_grad()
-def flash_attention_v1(q, k, v, dropout_prob=0.0, cast_dtype_for_dot=True):
+def flash_attention_v1(q, k, v, dropout_prob=0.0):
     # (batch_size, num_heads, seqlen, head_size)
     assert q.shape[:2] == k.shape[:2]
     assert q.shape[-1] == k.shape[-1]
@@ -490,7 +480,7 @@ def flash_attention_v1(q, k, v, dropout_prob=0.0, cast_dtype_for_dot=True):
     B, N, Lq, H = q.shape
     Lk = k.shape[2]
 
-    BLOCK_SIZE_L = 128
+    BLOCK_SIZE_L = 64
 
     assert H in {16, 32, 64, 128, 256}
     # above condition is necessary because shared memory is limited
@@ -522,7 +512,6 @@ def flash_attention_v1(q, k, v, dropout_prob=0.0, cast_dtype_for_dot=True):
         Lk,
         scale,
         H,
-        cast_dtype_for_dot=cast_dtype_for_dot,
         dropout_prob=dropout_prob,
         BLOCK_SIZE_L=BLOCK_SIZE_L,
     )
