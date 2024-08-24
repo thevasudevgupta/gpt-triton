@@ -11,6 +11,12 @@ from transformers import GPT2Model as HFGPT2
 from kernels import (flash_attention_v1, fused_embeddings, fused_ffn,
                      fused_layer_norm, matmul_and_split_qkv)
 
+GPU_TO_FLOPS = {
+    "v100": 130 * 10**12,
+    "a100": 312 * 10**12,
+    "h100": 989 * 10**12,
+}
+
 
 class FusedAttention(nn.Module):
     def __init__(
@@ -20,6 +26,8 @@ class FusedAttention(nn.Module):
         self.cast_dtype_for_dot = cast_dtype_for_dot
         self.dropout_prob = dropout_prob
         self.num_heads = num_heads
+
+        self.hidden_size = hidden_size
 
         self.layer_norm_weight = nn.Parameter(torch.ones(hidden_size))
         self.layer_norm_bias = nn.Parameter(torch.zeros(hidden_size))
@@ -56,10 +64,18 @@ class FusedAttention(nn.Module):
         )
         return x
 
+    def get_fwd_flops(self, num_tokens):
+        h = self.hidden_size
+        layer_norm = num_tokens * h + num_tokens * h
+        c_attn = num_tokens * (3 * h) * (2 * h) + num_tokens * (3 * h)
+        c_proj = num_tokens * h * (2 * h) + num_tokens * h
+        return layer_norm + c_attn + c_proj
+
 
 class FusedMLP(nn.Module):
     def __init__(self, hidden_size, dropout_prob=0.0, cast_dtype_for_dot=True):
         super().__init__()
+
         self.cast_dtype_for_dot = cast_dtype_for_dot
         self.dropout_prob = dropout_prob
 
@@ -73,6 +89,9 @@ class FusedMLP(nn.Module):
 
         self.ffn2_weight = nn.Parameter(torch.rand(intermediate_size, hidden_size))
         self.ffn2_bias = nn.Parameter(torch.rand(hidden_size))
+
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
 
     def forward(self, x):
         # mlp = DROPOUT(GELU(LN(X) @ A + a) @ B + b) + X
@@ -98,6 +117,14 @@ class FusedMLP(nn.Module):
             cast_dtype_for_dot=self.cast_dtype_for_dot,
         )
         return x
+
+    def get_fwd_flops(self, num_tokens):
+        h = self.hidden_size
+        mid = self.intermediate_size
+        layer_norm = num_tokens * h + num_tokens * h
+        ffn1 = num_tokens * mid * (2 * h) + num_tokens * mid
+        ffn2 = num_tokens * h * (2 * mid) + num_tokens * h
+        return layer_norm + ffn1 + ffn2
 
 
 @dataclass
@@ -164,6 +191,22 @@ class FusedGPT(nn.Module):
         # )
         return x
 
+    def get_fwd_flops(self, num_tokens):
+        h = self.config.n_embd
+        v = self.config.vocab_size
+        p = self.config.block_size
+        wte = num_tokens * h * (2 * v)
+        wpe = num_tokens * h * (2 * p)
+        blocks = sum(
+            [
+                module.get_fwd_flops(num_tokens)
+                for block in self.blocks
+                for module in block
+            ]
+        )
+        layer_norm = num_tokens * h + num_tokens * h
+        return blocks + layer_norm + wte + wpe
+
 
 def convert_huggingface_to_triton(hf_sd, hf_config):
     config = GPTConfig(
@@ -214,3 +257,19 @@ def convert_hf_and_load_model(model_id, device, cast_dtype_for_dot=True):
     model = FusedGPT(config, cast_dtype_for_dot=cast_dtype_for_dot)
     model.load_state_dict(state_dict)
     return model.to(device).eval(), hf_model.to(device).eval()
+
+
+def estimate_days(flops, mfu=0.45, gpu="h100", num_gpus=1):
+    # its probably very hard to achieve 0.45 mfu - LOL
+    # but thats kinda SOTA in papers from top labs
+    assert gpu in GPU_TO_FLOPS
+    return flops / (mfu * GPU_TO_FLOPS[gpu] * 3600 * 24 * num_gpus)
+
+
+def get_num_parameters(model):
+    return sum([p.numel() for p in model.parameters()])
+
+
+def compute_mfu(flops_per_second, gpu="h100"):
+    assert gpu in GPU_TO_FLOPS
+    return flops_per_second / GPU_TO_FLOPS[gpu]

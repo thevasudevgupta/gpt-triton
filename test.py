@@ -1,4 +1,4 @@
-# TRITON_INTERPRET=1 pytest -sv test.py::test_fused_embeddings
+# TRITON_INTERPRET=1 pytest -sv test.py
 
 import math
 
@@ -8,7 +8,8 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 
-from gpt import FusedGPT, convert_hf_and_load_model
+from gpt import (FusedGPT, GPTConfig, convert_hf_and_load_model, estimate_days,
+                 get_num_parameters)
 from kernels import (flash_attention_v1, fused_embeddings, fused_ffn,
                      fused_layer_norm)
 
@@ -134,3 +135,22 @@ def test_gpt2():
         print((out - hf_out).abs())
         # TODO: need to look at why we can't do low precision
         assert torch.allclose(out, hf_out, atol=1e-1), (out - hf_out).abs().max()
+
+
+def test_flops():
+    config = GPTConfig()
+    model = FusedGPT(config).eval()
+    num_tokens = 1024
+    fwd_flops = model.get_fwd_flops(num_tokens)
+    total_flops = fwd_flops * 3
+    num_parameters = get_num_parameters(model)
+    r = (fwd_flops * 3) / (6 * num_parameters * num_tokens)
+    assert r >= 0.9995, r
+
+
+def test_estimate_days():
+    # llama-3.1 paper reports 54 days for pre-training 405B parameter model
+    # its very close to what we get from following equation
+    flops = 6 * (405 * 10**9) * (15 * 10**12)
+    t = estimate_days(flops, mfu=0.45, gpu="h100", num_gpus=16_000)
+    assert t == 59.24544994944388, t
