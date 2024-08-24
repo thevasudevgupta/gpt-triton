@@ -4,7 +4,7 @@ import torch
 import triton
 from transformers import AutoTokenizer
 
-# from gpt import convert_hf_and_load_model
+from gpt import convert_hf_and_load_model
 
 STRING = """\
 Large language models have been shown to achieve remarkable performance across a variety of natural\
