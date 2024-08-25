@@ -12,14 +12,6 @@ python3 bench.py
 # triton: batch_size = 512 && t = 789.14
 # torch: batch_size = 1024 && OOM
 # triton: batch_size = 2048 && t = 3153.70
-
-# HuggingFace GPT
-# compute_mfu(6 * 124 * 10**6 * 512*512 / 1.801, gpu="h100")
-# => 10.9%
-
-# Triton GPT
-# compute_mfu(6 * 124 * 10**6 * 512*512 / 0.78914, gpu="h100")
-# => 24.9%
 ```
 
 **Supported Features**
