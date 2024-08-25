@@ -22,6 +22,23 @@ python3 bench.py
 # triton: couldn't hack the implementation yet
 ```
 
+```python
+from gpt import compute_mfu
+# fwd MFU
+
+# HuggingFace GPT (fp16)
+compute_mfu(2 * 124 * 10**6 * 512*512 / 0.302, gpu="h100")
+# 21.76%
+
+# HuggingFace GPT (mixed precision)
+compute_mfu(2 * 124 * 10**6 * 512*512 / 0.510, gpu="h100")
+# 12.88%
+
+# triton (mixed precision)
+compute_mfu(2 * 124 * 10**6 * 512*512 / 0.273, gpu="h100")
+# 24.07%
+```
+
 **Supported Features**
 * [x] fused implementation of several components of GPT block (for eg: `dropout(wte(x) + wpe(x))`, `dropout(wx + b)`, `gelu(wx + b)`)
 * [x] flash attention v1 algorithm
