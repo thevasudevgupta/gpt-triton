@@ -2,16 +2,24 @@ Triton implementation of GPT/LLAMA models. Objective of this project is to under
 
 **Performance**
 
-triton implementation is 2x faster and 4x memory efficient compared to HuggingFace Transformers implementation.
+triton implementation is more fast & memory efficient compared to HuggingFace Transformers implementation.
 
 ```bash
 python3 bench.py
 
-# 1 A100 40 GB
+# 1 A100 40 GB (fp32)
 # torch: batch_size = 512 && t = 1801.32
 # triton: batch_size = 512 && t = 789.14
 # torch: batch_size = 1024 && OOM
 # triton: batch_size = 2048 && t = 3153.70
+
+# 1 A100 40 GB (mixed-precision fp16)
+# torch: batch_size = 512 && t = 510.80
+# triton: batch_size = 512 && t = 429.80
+
+# 1 A100 40 GB (fp16)
+# torch: batch_size = 512 && t = 301.92
+# triton: couldn't hack the implementation yet
 ```
 
 **Supported Features**
