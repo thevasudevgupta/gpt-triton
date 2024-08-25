@@ -79,7 +79,7 @@ def fused_embeddings(x, wte, wpe, dropout_prob=0.0):
     B, L = x.shape
     V, H = wte.shape
     P = wpe.shape[0]
-    z = torch.empty((B * L, H), device=x.device)
+    z = torch.empty((B * L, H), device=x.device, dtype=wte.dtype)
     grid = (z.shape[0],)
     fused_embeddings_kernel[grid](
         x.view(-1),
@@ -154,7 +154,7 @@ def fused_layer_norm(x, weight, bias):
     x = x.view((-1, x.shape[-1]))
     B, H = x.shape
     x = x.view((B, H))
-    z = torch.empty(x.shape, device=x.device)
+    z = torch.empty(x.shape, device=x.device, dtype=x.dtype)
     fused_layer_norm_kernel[(B,)](x, weight, bias, z, H)
     return z.view(out_shape)
 
