@@ -13,9 +13,16 @@ time taken to process batch size - 512x300 on 1 A100 40 GB
 | precision              | HuggingFace GPT | Triton GPT |
 |------------------------|-----------------|------------|
 | fp32                   | 1800 ms         | -          |
-| tf32                   | 623.32 ms       | 462 ms     |
+| tf32                   | 631.35 ms       | 462.63 ms  |
 | mixed precision (fp16) | 510.80 ms       | 273 ms     |
 | fp16                   | 301.92 ms       | -          |
+
+|                        | max batch size |
+|------------------------|----------------|
+| HuggingFace GPT        | 1024           |
+| Triton GPT             | 2048           |
+
+_I considered batch sizes with power of 2 only. Both runs had seqlen=300 and mixed precision was enabled._
 
 ```python
 from gpt import compute_mfu
