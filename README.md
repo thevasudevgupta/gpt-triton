@@ -16,6 +16,7 @@ python3 bench.py
 | tf32                   | 631.35 ms       | 462.63 ms  |
 | mixed precision (fp16) | 510.80 ms       | 273 ms     |
 | fp16                   | 301.92 ms       | -          |
+
 _time taken to process batch size - 512x300 on 1 A100 40 GB_
 
  **Max Batch Size**
