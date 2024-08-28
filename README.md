@@ -8,7 +8,7 @@ triton implementation is more fast & memory efficient compared to HuggingFace Tr
 python3 bench.py
 ```
 
-time taken to process batch size - 512x300 on 1 A100 40 GB
+**Latency**
 
 | precision              | HuggingFace GPT | Triton GPT |
 |------------------------|-----------------|------------|
@@ -16,6 +16,9 @@ time taken to process batch size - 512x300 on 1 A100 40 GB
 | tf32                   | 631.35 ms       | 462.63 ms  |
 | mixed precision (fp16) | 510.80 ms       | 273 ms     |
 | fp16                   | 301.92 ms       | -          |
+_time taken to process batch size - 512x300 on 1 A100 40 GB_
+
+ **Max Batch Size**
 
 |                        | max batch size |
 |------------------------|----------------|
@@ -23,6 +26,8 @@ time taken to process batch size - 512x300 on 1 A100 40 GB
 | Triton GPT             | 2048           |
 
 _I considered batch sizes with power of 2 only. Both runs had seqlen=300 and mixed precision was enabled._
+
+**MFU**
 
 ```python
 from gpt import compute_mfu
